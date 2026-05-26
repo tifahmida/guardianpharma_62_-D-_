@@ -156,6 +156,28 @@ class _RegulatoryHomeState extends State<RegulatoryHome>
   }
 
   // ══════════════════════════════════════════════
+  // TOGGLE ACTIVE  ← NEW METHOD
+  // ══════════════════════════════════════════════
+
+  Future<void> _toggleActive(Map<String, dynamic> p) async {
+    final bool currentlyActive = p['is_active'] == true;
+    try {
+      await supabase
+          .from('pharmacies')
+          .update({'is_active': !currentlyActive})
+          .eq('id', p['id']);
+      _showMsg(
+        currentlyActive ? 'Pharmacy deactivated.' : 'Pharmacy activated!',
+        isError: currentlyActive,
+      );
+      await _loadAllPharmacies();
+      await _loadVerifyPharmacies();
+    } catch (e) {
+      _showMsg('Failed to update: $e', isError: true);
+    }
+  }
+
+  // ══════════════════════════════════════════════
   // DIALOGS
   // ══════════════════════════════════════════════
 
@@ -428,7 +450,7 @@ class _RegulatoryHomeState extends State<RegulatoryHome>
   }
 
   // ══════════════════════════════════════════════
-  // PHARMACY CARD (Tab 1)
+  // PHARMACY CARD (Tab 1)  ← UPDATED with Activate/Deactivate
   // ══════════════════════════════════════════════
   Widget _pharmacyCard(Map<String, dynamic> p) {
     final String status = _verifyStatus(p);
@@ -649,14 +671,70 @@ class _RegulatoryHomeState extends State<RegulatoryHome>
               ),
             ),
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Row(
+            child: Column(
               children: [
-                Expanded(
+                // Row 1: Edit + Delete
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.blueAccent,
+                          side: const BorderSide(
+                            color: Colors.blueAccent,
+                            width: 1.2,
+                          ),
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                        ),
+                        onPressed: () => _showEditDialog(p),
+                        icon: const Icon(Icons.edit, size: 16),
+                        label: const Text(
+                          'Edit',
+                          style: TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.redAccent,
+                        side: const BorderSide(
+                          color: Colors.redAccent,
+                          width: 1.2,
+                        ),
+                        padding: const EdgeInsets.symmetric(
+                          vertical: 8,
+                          horizontal: 14,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      onPressed: () => _showDeleteDialog(p),
+                      icon: const Icon(Icons.delete, size: 16),
+                      label: const Text(
+                        'Delete',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                // Row 2: Activate / Deactivate (full width)  ← NEW
+                SizedBox(
+                  width: double.infinity,
                   child: OutlinedButton.icon(
                     style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.blueAccent,
-                      side: const BorderSide(
-                        color: Colors.blueAccent,
+                      foregroundColor: isActive
+                          ? Colors.orangeAccent
+                          : Colors.greenAccent,
+                      side: BorderSide(
+                        color: isActive
+                            ? Colors.orangeAccent
+                            : Colors.greenAccent,
                         width: 1.2,
                       ),
                       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -664,32 +742,15 @@ class _RegulatoryHomeState extends State<RegulatoryHome>
                         borderRadius: BorderRadius.circular(10),
                       ),
                     ),
-                    onPressed: () => _showEditDialog(p),
-                    icon: const Icon(Icons.edit, size: 16),
-                    label: const Text(
-                      'Edit',
-                      style: TextStyle(fontWeight: FontWeight.bold),
+                    onPressed: () => _toggleActive(p),
+                    icon: Icon(
+                      isActive ? Icons.block : Icons.check_circle_outline,
+                      size: 16,
                     ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton.icon(
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.redAccent,
-                    side: const BorderSide(color: Colors.redAccent, width: 1.2),
-                    padding: const EdgeInsets.symmetric(
-                      vertical: 8,
-                      horizontal: 14,
+                    label: Text(
+                      isActive ? 'Deactivate' : 'Activate',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                  onPressed: () => _showDeleteDialog(p),
-                  icon: const Icon(Icons.delete, size: 16),
-                  label: const Text(
-                    'Delete',
-                    style: TextStyle(fontWeight: FontWeight.bold),
                   ),
                 ),
               ],
@@ -1472,7 +1533,6 @@ class _RegulatoryHomeState extends State<RegulatoryHome>
                 const SizedBox(height: 12),
 
                 // ── TAB BAR ───────────────────────────────
-                // Tab titles: Pharmacies | Add Pharmacy | Pharmacy Verification
                 Container(
                   margin: const EdgeInsets.symmetric(horizontal: 16),
                   decoration: BoxDecoration(

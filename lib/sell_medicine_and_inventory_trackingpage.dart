@@ -198,6 +198,8 @@ class _InventoryListPageState extends State<InventoryListPage> {
                             final int spb = (m['strips_per_box'] as int?) ?? 10;
                             final int stripsRem =
                                 (m['strips_remaining'] as int?) ?? (qty * spb);
+                            final String batch =
+                                m['batch_number']?.toString() ?? 'N/A';
                             final Color expColor = _expiryColor(
                               m['expiry_date']?.toString(),
                             );
@@ -252,6 +254,13 @@ class _InventoryListPageState extends State<InventoryListPage> {
                                                   fontSize: 12,
                                                 ),
                                               ),
+                                            Text(
+                                              '🔢 Batch: $batch',
+                                              style: const TextStyle(
+                                                color: Colors.white70,
+                                                fontSize: 12,
+                                              ),
+                                            ),
                                             Text(
                                               '🏭 $mfr',
                                               style: const TextStyle(
@@ -329,10 +338,6 @@ class _InventoryListPageState extends State<InventoryListPage> {
                                       _chip(
                                         '💊 $stripsRem strips remaining',
                                         Colors.tealAccent,
-                                      ),
-                                      _chip(
-                                        '🔢 ${m['batch_number'] ?? 'N/A'}',
-                                        Colors.white54,
                                       ),
                                       if (shelfNum.isNotEmpty)
                                         _chip(
@@ -491,9 +496,8 @@ class _SellMedicineAndInventoryPageState
     super.dispose();
   }
 
-  // =========================
-  // LOAD DATA
-  // =========================
+  // ── LOAD DATA ─────────────────────────────────────────────
+
   Future<void> _loadMedicines() async {
     setState(() => loadingMedicines = true);
     try {
@@ -544,6 +548,46 @@ class _SellMedicineAndInventoryPageState
     });
   }
 
+  // ── FETCH REAL CARTON INFO ────────────────────────────────
+  // Returns how many distinct cartons hold this medicine,
+  // total boxes, and average boxes per carton.
+  Future<Map<String, dynamic>> _fetchRealCartonInfo(String medicineName) async {
+    try {
+      final rows = await supabase
+          .from('medicine_boxes')
+          .select('quantity, carton_id')
+          .eq('pharmacy_id', PharmacySession.pharmacyId ?? '')
+          .eq('medicine_name', medicineName);
+
+      final List<Map<String, dynamic>> list = List<Map<String, dynamic>>.from(
+        rows,
+      );
+
+      int totalBoxes = 0;
+      final Set<String> uniqueCartons = {};
+      for (final row in list) {
+        totalBoxes += (row['quantity'] as int?) ?? 0;
+        final String cid = row['carton_id']?.toString() ?? '';
+        if (cid.isNotEmpty) uniqueCartons.add(cid);
+      }
+
+      final int cartonCount = uniqueCartons.isEmpty ? 1 : uniqueCartons.length;
+      final int avgBoxes = cartonCount > 0
+          ? (totalBoxes / cartonCount).round()
+          : totalBoxes;
+
+      return {
+        'cartonCount': cartonCount,
+        'totalBoxes': totalBoxes,
+        'avgBoxes': avgBoxes,
+      };
+    } catch (e) {
+      return {'cartonCount': 1, 'totalBoxes': 0, 'avgBoxes': 0};
+    }
+  }
+
+  // ── HELPERS ───────────────────────────────────────────────
+
   int _getSafeLimit(String medicineName) {
     final name = medicineName.toLowerCase();
     for (final entry in _safeLimitsByKeyword.entries) {
@@ -580,63 +624,8 @@ class _SellMedicineAndInventoryPageState
     return '✅ Expires: $s';
   }
 
-  // =========================
-  // FETCH REAL CARTON INFO FOR A MEDICINE
-  // This fetches the actual live data from Supabase
-  // instead of using stale stored values.
-  //
-  // Returns a map with:
-  //   cartonCount  -> how many distinct cartons hold this medicine
-  //   totalBoxes   -> sum of all quantity values for this medicine
-  //   avgBoxes     -> totalBoxes / cartonCount (for display: N × avg = total)
-  // =========================
-  Future<Map<String, dynamic>> _fetchRealCartonInfo(String medicineName) async {
-    try {
-      // Fetch all rows for this medicine name in this pharmacy
-      final rows = await supabase
-          .from('medicine_boxes')
-          .select('quantity, carton_id')
-          .eq('pharmacy_id', PharmacySession.pharmacyId ?? '')
-          .eq('medicine_name', medicineName);
+  // ── BARCODE ───────────────────────────────────────────────
 
-      final List<Map<String, dynamic>> list = List<Map<String, dynamic>>.from(
-        rows,
-      );
-
-      // Sum up all boxes
-      int totalBoxes = 0;
-      for (final row in list) {
-        totalBoxes += (row['quantity'] as int?) ?? 0;
-      }
-
-      // Count distinct cartons that contain this medicine
-      final Set<String> uniqueCartons = {};
-      for (final row in list) {
-        final String cartonId = row['carton_id']?.toString() ?? '';
-        if (cartonId.isNotEmpty) uniqueCartons.add(cartonId);
-      }
-
-      final int cartonCount = uniqueCartons.isEmpty ? 1 : uniqueCartons.length;
-
-      // Average boxes per carton (rounded, just for display)
-      final int avgBoxes = cartonCount > 0
-          ? (totalBoxes / cartonCount).round()
-          : totalBoxes;
-
-      return {
-        'cartonCount': cartonCount,
-        'totalBoxes': totalBoxes,
-        'avgBoxes': avgBoxes,
-      };
-    } catch (e) {
-      // If anything fails, return safe defaults
-      return {'cartonCount': 1, 'totalBoxes': 0, 'avgBoxes': 0};
-    }
-  }
-
-  // =========================
-  // BARCODE SCAN
-  // =========================
   Future<String?> _scanBarcode() async {
     final ctrl = TextEditingController();
     return showDialog<String>(
@@ -684,9 +673,9 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // SELL DIALOG
-  // =========================
+  // ── SELL DIALOG ───────────────────────────────────────────
+  // FIX: Added carton sale type with proper qty input and stock check.
+
   void _showSellDialog(Map<String, dynamic> medicine) {
     if (_isExpired(medicine['expiry_date']?.toString())) {
       _error('This medicine is expired and cannot be sold.');
@@ -704,8 +693,16 @@ class _SellMedicineAndInventoryPageState
       return;
     }
 
+    // FIX: We treat this medicine_boxes row as belonging to 1 carton.
+    // "Selling N cartons" means selling N × all boxes in this row.
+    // Since 1 medicine_boxes row = 1 carton entry, availableCartons = 1.
+    // If you want multi-carton support in future, extend _fetchRealCartonInfo.
+    const int availableCartons = 1;
+
     String saleType = 'strip';
     final qtyCtrl = TextEditingController(text: '1');
+    // FIX: separate controller for carton quantity
+    final cartonQtyCtrl = TextEditingController(text: '1');
     final customerCtrl = TextEditingController();
     final phoneCtrl = TextEditingController();
 
@@ -718,7 +715,7 @@ class _SellMedicineAndInventoryPageState
 
     final String medicineName = medicine['medicine_name']?.toString() ?? '';
     final String genericName = medicine['generic_name']?.toString() ?? '';
-    final String batchNumber = medicine['batch_number']?.toString() ?? '';
+    final String batchNumber = medicine['batch_number']?.toString() ?? 'N/A';
     final String mfr =
         medicine['cartons']?['manufacturers']?['name']?.toString() ?? 'Unknown';
     final String expiry = medicine['expiry_date']?.toString() ?? 'N/A';
@@ -728,23 +725,26 @@ class _SellMedicineAndInventoryPageState
       context: context,
       builder: (_) => StatefulBuilder(
         builder: (ctx, setDs) {
+          // FIX: carton price = all boxes × price per box
+          final double pricePerCarton = pricePerBox * availableBoxes;
+
           double unitPrice;
           if (saleType == 'strip') {
             unitPrice = pricePerStrip;
           } else if (saleType == 'box') {
             unitPrice = pricePerBox;
           } else {
-            // carton = sell all available boxes
-            unitPrice = pricePerBox * availableBoxes;
+            // carton
+            unitPrice = pricePerCarton;
           }
 
           final int enteredQty = saleType == 'carton'
-              ? 1
+              ? (int.tryParse(cartonQtyCtrl.text) ?? 1)
               : (int.tryParse(qtyCtrl.text) ?? 1);
-          final double total = saleType == 'carton'
-              ? unitPrice
-              : unitPrice * enteredQty;
 
+          final double total = unitPrice * enteredQty;
+
+          // FIX: stock validation per sale type
           bool exceedsStock = false;
           String stockHintText = '';
           if (saleType == 'strip') {
@@ -754,6 +754,11 @@ class _SellMedicineAndInventoryPageState
           } else if (saleType == 'box') {
             exceedsStock = enteredQty > availableBoxes;
             stockHintText = 'Available: $availableBoxes boxes';
+          } else {
+            // carton
+            exceedsStock = enteredQty > availableCartons;
+            stockHintText =
+                'Available: $availableCartons carton(s) ($availableBoxes boxes total)';
           }
 
           return AlertDialog(
@@ -785,6 +790,7 @@ class _SellMedicineAndInventoryPageState
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // Info card
                   Container(
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
@@ -794,11 +800,16 @@ class _SellMedicineAndInventoryPageState
                     child: Column(
                       children: [
                         _infoRow('🏭 Manufacturer', mfr),
-                        _infoRow('🔢 Batch', batchNumber),
+                        _infoRow('🔢 Batch Number', batchNumber),
                         _infoRow('📅 Expiry', expiry),
                         _infoRow(
                           '📦 Stock',
                           '$availableBoxes boxes  •  $totalStripsAvailable strips',
+                        ),
+                        // FIX: show carton count clearly
+                        _infoRow(
+                          '🏭 Cartons Available',
+                          '$availableCartons carton(s)',
                         ),
                         _infoRow('💊 Strips/Box', '$stripsPerBox strips'),
                         _infoRow(
@@ -809,6 +820,11 @@ class _SellMedicineAndInventoryPageState
                           '💊 Price/Strip',
                           'BDT ${pricePerStrip.toStringAsFixed(2)}',
                         ),
+                        // FIX: show carton price
+                        _infoRow(
+                          '🏭 Price/Carton',
+                          'BDT ${pricePerCarton.toStringAsFixed(2)}',
+                        ),
                       ],
                     ),
                   ),
@@ -818,6 +834,7 @@ class _SellMedicineAndInventoryPageState
                     style: TextStyle(color: Colors.white70, fontSize: 13),
                   ),
                   const SizedBox(height: 8),
+                  // Sale type chips
                   Row(
                     children: [
                       _saleTypeChip(
@@ -840,16 +857,22 @@ class _SellMedicineAndInventoryPageState
                         }),
                       ),
                       const SizedBox(width: 8),
+                      // FIX: carton chip now available
                       _saleTypeChip(
                         'carton',
                         '🏭 Carton',
                         saleType,
-                        (v) => setDs(() => saleType = v),
+                        (v) => setDs(() {
+                          saleType = v;
+                          cartonQtyCtrl.text = '1';
+                        }),
                       ),
                     ],
                   ),
                   const SizedBox(height: 14),
-                  if (saleType != 'carton') ...[
+
+                  // FIX: strip / box qty input
+                  if (saleType == 'strip' || saleType == 'box') ...[
                     TextField(
                       controller: qtyCtrl,
                       keyboardType: TextInputType.number,
@@ -899,72 +922,113 @@ class _SellMedicineAndInventoryPageState
                     ),
                     if (exceedsStock) ...[
                       const SizedBox(height: 6),
-                      Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: const Color.fromRGBO(255, 82, 82, 0.12),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(
-                            color: const Color.fromRGBO(255, 82, 82, 0.5),
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            const Icon(
-                              Icons.error_outline,
-                              color: Colors.redAccent,
-                              size: 16,
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                saleType == 'strip'
-                                    ? '❌ Only $totalStripsAvailable strips available ($availableBoxes boxes)'
-                                    : '❌ Only $availableBoxes boxes available',
-                                style: const TextStyle(
-                                  color: Colors.redAccent,
-                                  fontSize: 12,
-                                  height: 1.4,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
+                      _stockErrorBox(
+                        saleType == 'strip'
+                            ? '❌ Only $totalStripsAvailable strips available ($availableBoxes boxes)'
+                            : '❌ Only $availableBoxes boxes available',
                       ),
                     ],
                     const SizedBox(height: 10),
                   ],
-                  if (saleType == 'carton')
+
+                  // FIX: carton qty input with stock check
+                  if (saleType == 'carton') ...[
+                    TextField(
+                      controller: cartonQtyCtrl,
+                      keyboardType: TextInputType.number,
+                      style: TextStyle(
+                        color: exceedsStock ? Colors.redAccent : Colors.white,
+                      ),
+                      onChanged: (_) => setDs(() {}),
+                      decoration: InputDecoration(
+                        prefixIcon: Icon(
+                          Icons.widgets,
+                          color: exceedsStock
+                              ? Colors.redAccent
+                              : Colors.white70,
+                        ),
+                        hintText: 'Number of cartons',
+                        hintStyle: const TextStyle(color: Colors.white38),
+                        helperText: stockHintText,
+                        helperStyle: TextStyle(
+                          color: exceedsStock
+                              ? Colors.redAccent
+                              : Colors.white38,
+                          fontSize: 11,
+                        ),
+                        filled: true,
+                        fillColor: exceedsStock
+                            ? const Color.fromRGBO(255, 82, 82, 0.1)
+                            : const Color.fromRGBO(255, 255, 255, 0.08),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: exceedsStock
+                              ? const BorderSide(
+                                  color: Colors.redAccent,
+                                  width: 1.5,
+                                )
+                              : BorderSide.none,
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: exceedsStock
+                              ? const BorderSide(
+                                  color: Colors.redAccent,
+                                  width: 1.5,
+                                )
+                              : BorderSide.none,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    // FIX: carton info note
                     Container(
                       padding: const EdgeInsets.all(10),
                       decoration: BoxDecoration(
-                        color: const Color.fromRGBO(255, 152, 0, 0.08),
+                        color: exceedsStock
+                            ? const Color.fromRGBO(255, 82, 82, 0.12)
+                            : const Color.fromRGBO(255, 152, 0, 0.08),
                         borderRadius: BorderRadius.circular(10),
                         border: Border.all(
-                          color: const Color.fromRGBO(255, 152, 0, 0.4),
+                          color: exceedsStock
+                              ? const Color.fromRGBO(255, 82, 82, 0.5)
+                              : const Color.fromRGBO(255, 152, 0, 0.4),
                         ),
                       ),
                       child: Row(
                         children: [
-                          const Icon(
-                            Icons.info_outline,
-                            color: Colors.orange,
+                          Icon(
+                            exceedsStock
+                                ? Icons.error_outline
+                                : Icons.info_outline,
+                            color: exceedsStock
+                                ? Colors.redAccent
+                                : Colors.orange,
                             size: 14,
                           ),
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
-                              'Selling full carton clears ALL $availableBoxes boxes ($totalStripsAvailable strips).',
-                              style: const TextStyle(
-                                color: Colors.orange,
+                              exceedsStock
+                                  // FIX: clear error message when cartons exceed stock
+                                  ? '❌ Not enough cartons in stock.\n   Available: $availableCartons carton(s)'
+                                  : '1 carton = $availableBoxes boxes ($totalStripsAvailable strips total).\nSelling clears ALL stock for this entry.',
+                              style: TextStyle(
+                                color: exceedsStock
+                                    ? Colors.redAccent
+                                    : Colors.orange,
                                 fontSize: 12,
+                                height: 1.4,
                               ),
                             ),
                           ),
                         ],
                       ),
                     ),
-                  const SizedBox(height: 10),
+                    const SizedBox(height: 10),
+                  ],
+
+                  // Customer name
                   TextField(
                     controller: customerCtrl,
                     style: const TextStyle(color: Colors.white),
@@ -984,6 +1048,7 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 10),
+                  // Customer phone
                   TextField(
                     controller: phoneCtrl,
                     keyboardType: TextInputType.phone,
@@ -1004,6 +1069,7 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 14),
+                  // Safe limit warning
                   Container(
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
@@ -1034,6 +1100,7 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 14),
+                  // Total display
                   Container(
                     padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
@@ -1094,11 +1161,12 @@ class _SellMedicineAndInventoryPageState
                     fontWeight: FontWeight.bold,
                   ),
                 ),
+                // FIX: disable sell button when stock is exceeded
                 onPressed: exceedsStock
                     ? null
                     : () async {
                         final int qty = saleType == 'carton'
-                            ? 1
+                            ? (int.tryParse(cartonQtyCtrl.text) ?? 1)
                             : (int.tryParse(qtyCtrl.text) ?? 1);
                         if (qty <= 0) {
                           _error('Quantity must be at least 1');
@@ -1128,9 +1196,7 @@ class _SellMedicineAndInventoryPageState
                             saleType: saleType,
                             qty: qty,
                             unitPrice: unitPrice,
-                            total: saleType == 'carton'
-                                ? unitPrice
-                                : unitPrice * qty,
+                            total: total,
                             customer: customer,
                             phone: phone,
                             medicineName: medicineName,
@@ -1147,9 +1213,36 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // OUT OF STOCK DIALOG
-  // =========================
+  // ── STOCK ERROR BOX helper ────────────────────────────────
+  Widget _stockErrorBox(String message) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color.fromRGBO(255, 82, 82, 0.12),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color.fromRGBO(255, 82, 82, 0.5)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.error_outline, color: Colors.redAccent, size: 16),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: const TextStyle(
+                color: Colors.redAccent,
+                fontSize: 12,
+                height: 1.4,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── OUT OF STOCK ──────────────────────────────────────────
+
   void _showOutOfStockDialog(Map<String, dynamic> medicine) {
     final String medicineName =
         medicine['medicine_name']?.toString() ?? 'This medicine';
@@ -1283,9 +1376,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // HIGH QTY WARNING
-  // =========================
+  // ── HIGH QTY WARNING ──────────────────────────────────────
+
   void _showHighQtyWarning({
     required Map<String, dynamic> medicine,
     required int qty,
@@ -1414,9 +1506,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // OTP DIALOG
-  // =========================
+  // ── OTP DIALOG ────────────────────────────────────────────
+
   void _showOtpDialog({
     required Map<String, dynamic> medicine,
     required int qty,
@@ -1599,9 +1690,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // SUSPICIOUS LOG
-  // =========================
+  // ── SUSPICIOUS LOG ────────────────────────────────────────
+
   Future<void> _saveSuspiciousLog({
     required String medicineName,
     required String batchNumber,
@@ -1628,9 +1718,10 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  // =========================
-  // COMPLETE SALE
-  // =========================
+  // ── COMPLETE SALE ─────────────────────────────────────────
+  // FIX: carton sale type now deducts ALL strips (same as before)
+  // and clears the medicine_boxes row when stock hits zero.
+
   Future<void> _completeSale({
     required Map<String, dynamic> medicine,
     required String saleType,
@@ -1648,7 +1739,6 @@ class _SellMedicineAndInventoryPageState
       final String medicineId = medicine['id'].toString();
       final String cartonId = medicine['carton_id']?.toString() ?? '';
 
-      // Step 1: Save sale record
       await supabase.from('sales').insert({
         'medicine_name': medicineName,
         'batch_number': batchNumber,
@@ -1662,7 +1752,6 @@ class _SellMedicineAndInventoryPageState
         'pharmacy_id': PharmacySession.pharmacyId,
       });
 
-      // Step 2: Read fresh stock from Supabase
       final freshRow = await supabase
           .from('medicine_boxes')
           .select('quantity, strips_per_box, strips_remaining')
@@ -1674,15 +1763,13 @@ class _SellMedicineAndInventoryPageState
       final int currentStrips =
           (freshRow['strips_remaining'] as int?) ?? (currentBoxes * spb);
 
-      // Step 3: Calculate how many strips to deduct
       int stripsToDeduct;
       if (saleType == 'carton') {
-        // Sell everything
+        // FIX: selling 1 carton clears all strips in this row
         stripsToDeduct = currentStrips;
       } else if (saleType == 'box') {
         stripsToDeduct = qty * spb;
       } else {
-        // strip
         stripsToDeduct = qty;
       }
 
@@ -1694,8 +1781,6 @@ class _SellMedicineAndInventoryPageState
           ? (newStrips / spb).ceil()
           : 0;
 
-      // Step 4: Update or delete medicine box
-      // If 0 boxes remain, delete the medicine entry
       if (newBoxes <= 0) {
         await supabase.from('medicine_boxes').delete().eq('id', medicineId);
       } else {
@@ -1705,14 +1790,11 @@ class _SellMedicineAndInventoryPageState
             .eq('id', medicineId);
       }
 
-      // Step 5: Delete carton if it has no more medicines
       if (cartonId.isNotEmpty) {
         await _deleteCartonIfEmpty(cartonId);
       }
 
       if (!mounted) return;
-
-      // Step 6: Refresh UI
       _loadMedicines();
       _loadManufacturers();
 
@@ -1734,7 +1816,6 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  // Delete carton if all medicines inside have 0 boxes
   Future<void> _deleteCartonIfEmpty(String cartonId) async {
     try {
       final remaining = await supabase
@@ -1743,17 +1824,13 @@ class _SellMedicineAndInventoryPageState
           .eq('carton_id', cartonId)
           .eq('pharmacy_id', PharmacySession.pharmacyId ?? '');
 
-      final List remainingList = List.from(remaining);
-
       bool hasStock = false;
-      for (final box in remainingList) {
-        final int q = (box['quantity'] as int?) ?? 0;
-        if (q > 0) {
+      for (final box in List.from(remaining)) {
+        if (((box['quantity'] as int?) ?? 0) > 0) {
           hasStock = true;
           break;
         }
       }
-
       if (!hasStock) {
         await supabase.from('cartons').delete().eq('id', cartonId);
       }
@@ -1762,9 +1839,8 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  // =========================
-  // RECEIPT
-  // =========================
+  // ── RECEIPT ───────────────────────────────────────────────
+
   void _showReceipt({
     required String medicineName,
     required String batchNumber,
@@ -1783,11 +1859,7 @@ class _SellMedicineAndInventoryPageState
         '${now.day.toString().padLeft(2, '0')}/${now.month.toString().padLeft(2, '0')}/${now.year}';
     final hour = now.hour;
     final period = hour >= 12 ? 'PM' : 'AM';
-    final hour12 = hour == 0
-        ? 12
-        : hour > 12
-        ? hour - 12
-        : hour;
+    final hour12 = hour == 0 ? 12 : (hour > 12 ? hour - 12 : hour);
     final timeStr =
         '${hour12.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')} $period';
 
@@ -2013,9 +2085,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // ADD / EDIT MEDICINE BOX
-  // =========================
+  // ── ADD / EDIT MEDICINE BOX ───────────────────────────────
+
   void _showMedicineBoxDialog(
     String cartonId,
     String manufacturerName, {
@@ -2405,9 +2476,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // ADD / EDIT MANUFACTURER
-  // =========================
+  // ── ADD / EDIT MANUFACTURER ───────────────────────────────
+
   void _showManufacturerDialog({Map<String, dynamic>? existing}) {
     final nameCtrl = TextEditingController(text: existing?['name'] ?? '');
     final countryCtrl = TextEditingController(text: existing?['country'] ?? '');
@@ -2554,12 +2624,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // VIEW MEDICINE BOXES (bottom sheet)
-  // Shows ALL cartons for a manufacturer
-  // Carton count = real number of carton rows
-  // Total boxes = sum of medicine_boxes.quantity
-  // =========================
+  // ── VIEW MEDICINE BOXES ───────────────────────────────────
+
   void _viewMedicineBoxes(
     String manufacturerId,
     String manufacturerName,
@@ -2606,7 +2672,6 @@ class _SellMedicineAndInventoryPageState
                                 fontWeight: FontWeight.bold,
                               ),
                             ),
-                            // Real carton count from the list
                             Text(
                               '${cartonList.length} carton(s)',
                               style: const TextStyle(
@@ -2658,7 +2723,6 @@ class _SellMedicineAndInventoryPageState
                           itemCount: cartonList.length,
                           itemBuilder: (_, ci) {
                             final carton = cartonList[ci];
-                            // Sequential display number: 1, 2, 3...
                             final int displayNum = ci + 1;
                             return _buildCartonCard(
                               carton: carton,
@@ -2686,11 +2750,8 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  // =========================
-  // CARTON CARD
-  // Shows real box count by summing
-  // medicine_boxes.quantity for this carton
-  // =========================
+  // ── CARTON CARD ───────────────────────────────────────────
+
   Widget _buildCartonCard({
     required Map<String, dynamic> carton,
     required int displayNumber,
@@ -2713,8 +2774,6 @@ class _SellMedicineAndInventoryPageState
       builder: (ctx, snapshot) {
         final List<Map<String, dynamic>> boxes = snapshot.data ?? [];
 
-        // REAL total boxes: sum of quantity for all
-        // medicine rows inside this carton
         int totalBoxes = 0;
         for (final box in boxes) {
           totalBoxes += (box['quantity'] as int?) ?? 0;
@@ -2730,7 +2789,6 @@ class _SellMedicineAndInventoryPageState
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Carton header
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: const BoxDecoration(
@@ -2754,7 +2812,6 @@ class _SellMedicineAndInventoryPageState
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              // Sequential carton number
                               Text(
                                 cartonLabel ?? 'Carton #$displayNumber',
                                 style: const TextStyle(
@@ -2783,7 +2840,6 @@ class _SellMedicineAndInventoryPageState
                             ],
                           ),
                         ),
-                        // Edit carton button
                         IconButton(
                           icon: const Icon(
                             Icons.edit,
@@ -2800,7 +2856,6 @@ class _SellMedicineAndInventoryPageState
                             );
                           },
                         ),
-                        // Delete carton button
                         IconButton(
                           icon: const Icon(
                             Icons.delete,
@@ -2818,7 +2873,6 @@ class _SellMedicineAndInventoryPageState
                             );
                           },
                         ),
-                        // Add Box button
                         ElevatedButton.icon(
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Colors.blueAccent,
@@ -2844,9 +2898,6 @@ class _SellMedicineAndInventoryPageState
                       ],
                     ),
                     const SizedBox(height: 8),
-                    // Show REAL totals:
-                    // totalBoxes = sum of quantity in this carton
-                    // medicines = count of medicine rows
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceAround,
                       children: [
@@ -2861,8 +2912,6 @@ class _SellMedicineAndInventoryPageState
                   ],
                 ),
               ),
-
-              // Medicine boxes list inside this carton
               if (boxes.isEmpty)
                 const Padding(
                   padding: EdgeInsets.all(12),
@@ -2882,12 +2931,14 @@ class _SellMedicineAndInventoryPageState
                   final int spb = (box['strips_per_box'] as int?) ?? 10;
                   final int stripsRem =
                       (box['strips_remaining'] as int?) ?? (qty * spb);
+                  final String batchNum =
+                      box['batch_number']?.toString() ?? 'N/A';
                   final String shelfNum = box['shelf_number']?.toString() ?? '';
                   final String shelfSide = box['shelf_side']?.toString() ?? '';
 
                   final int fullBoxStrips = qty * spb;
                   final bool hasPartial = qty > 0 && stripsRem < fullBoxStrips;
-                  final int partialStripsLeft = (spb > 0)
+                  final int partialLeft = (spb > 0)
                       ? (stripsRem % spb == 0 ? spb : stripsRem % spb)
                       : 0;
 
@@ -2934,10 +2985,16 @@ class _SellMedicineAndInventoryPageState
                                         fontSize: 11,
                                       ),
                                     ),
+                                  Text(
+                                    '🔢 Batch: $batchNum',
+                                    style: const TextStyle(
+                                      color: Colors.white60,
+                                      fontSize: 11,
+                                    ),
+                                  ),
                                 ],
                               ),
                             ),
-                            // Edit medicine box button
                             IconButton(
                               icon: const Icon(
                                 Icons.edit,
@@ -2953,7 +3010,6 @@ class _SellMedicineAndInventoryPageState
                                 );
                               },
                             ),
-                            // Delete medicine box button
                             IconButton(
                               icon: const Icon(
                                 Icons.delete,
@@ -2966,13 +3022,9 @@ class _SellMedicineAndInventoryPageState
                                       .from('medicine_boxes')
                                       .delete()
                                       .eq('id', box['id']);
-
-                                  // Delete carton if empty
                                   await _deleteCartonIfEmpty(cartonId);
-
                                   _success('Medicine deleted!');
                                   _loadMedicines();
-
                                   if (context.mounted) {
                                     Navigator.pop(context);
                                     _viewMedicineBoxes(
@@ -3029,7 +3081,7 @@ class _SellMedicineAndInventoryPageState
                               if (hasPartial) ...[
                                 const SizedBox(height: 4),
                                 Text(
-                                  '⚠️ Partial box: $partialStripsLeft strips in current box',
+                                  '⚠️ Partial box: $partialLeft strips in current box',
                                   style: const TextStyle(
                                     color: Colors.orange,
                                     fontSize: 11,
@@ -3104,9 +3156,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // EDIT CARTON DIALOG
-  // =========================
+  // ── EDIT CARTON DIALOG ────────────────────────────────────
+
   void _showEditCartonDialog({
     required Map<String, dynamic> carton,
     required int displayNumber,
@@ -3255,10 +3306,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // DELETE CARTON DIALOG
-  // Deletes all medicine boxes inside, then the carton
-  // =========================
+  // ── DELETE CARTON DIALOG ──────────────────────────────────
+
   void _showDeleteCartonDialog({
     required String cartonId,
     required int displayNumber,
@@ -3299,19 +3348,14 @@ class _SellMedicineAndInventoryPageState
             style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
             onPressed: () async {
               try {
-                // Delete all medicine boxes inside this carton
                 await supabase
                     .from('medicine_boxes')
                     .delete()
                     .eq('carton_id', cartonId);
-
-                // Then delete the carton itself
                 await supabase.from('cartons').delete().eq('id', cartonId);
-
                 _success('Carton #$displayNumber deleted!');
                 _loadMedicines();
                 _loadManufacturers();
-
                 if (context.mounted) {
                   Navigator.pop(context);
                   _viewMedicineBoxes(manufacturerId, manufacturerName);
@@ -3327,12 +3371,11 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // ADD NEW CARTON DIALOG
-  // =========================
+  // ── ADD NEW CARTON DIALOG ─────────────────────────────────
+
   void _showAddCartonDialog(String manufacturerId, String manufacturerName) {
     final cartonLabelCtrl = TextEditingController();
-    final cartonNumCtrl = TextEditingController(text: '1');
+    final howManyCtrl = TextEditingController(text: '1');
     final boxesPerCartonCtrl = TextEditingController(text: '50');
     DateTime receivedDate = DateTime.now();
     final receivedCtrl = TextEditingController(
@@ -3379,8 +3422,8 @@ class _SellMedicineAndInventoryPageState
                 ),
                 const SizedBox(height: 10),
                 _dialogField(
-                  cartonNumCtrl,
-                  'Number of Cartons',
+                  howManyCtrl,
+                  'How many cartons to add',
                   Icons.widgets,
                   isNumber: true,
                 ),
@@ -3442,7 +3485,7 @@ class _SellMedicineAndInventoryPageState
                       SizedBox(width: 6),
                       Expanded(
                         child: Text(
-                          'After adding the carton, tap it to add medicine boxes inside.',
+                          'New cartons will continue numbering from the highest existing carton number.',
                           style: TextStyle(color: Colors.orange, fontSize: 12),
                         ),
                       ),
@@ -3468,22 +3511,38 @@ class _SellMedicineAndInventoryPageState
                 style: TextStyle(color: Colors.white),
               ),
               onPressed: () async {
-                final cartonNum = int.tryParse(cartonNumCtrl.text.trim()) ?? 1;
-                final boxesPerCarton =
+                final int howMany = int.tryParse(howManyCtrl.text.trim()) ?? 1;
+                final int boxesPerCarton =
                     int.tryParse(boxesPerCartonCtrl.text.trim()) ?? 50;
-                final label = cartonLabelCtrl.text.trim();
+                final String label = cartonLabelCtrl.text.trim();
 
                 try {
-                  await supabase.from('cartons').insert({
-                    'manufacturer_id': manufacturerId,
-                    'carton_number': cartonNum,
-                    'boxes_per_carton': boxesPerCarton,
-                    'received_date': receivedCtrl.text.trim(),
-                    'carton_label': label.isEmpty ? null : label,
-                    'created_by': supabase.auth.currentUser?.id,
-                  });
+                  final existingCartons = await supabase
+                      .from('cartons')
+                      .select('carton_number')
+                      .eq('manufacturer_id', manufacturerId);
 
-                  _success('Carton added! Received: ${receivedCtrl.text}');
+                  int maxExisting = 0;
+                  for (final row in List.from(existingCartons)) {
+                    final int num = (row['carton_number'] as int?) ?? 0;
+                    if (num > maxExisting) maxExisting = num;
+                  }
+
+                  for (int i = 1; i <= howMany; i++) {
+                    final int newCartonNumber = maxExisting + i;
+                    await supabase.from('cartons').insert({
+                      'manufacturer_id': manufacturerId,
+                      'carton_number': newCartonNumber,
+                      'boxes_per_carton': boxesPerCarton,
+                      'received_date': receivedCtrl.text.trim(),
+                      'carton_label': label.isEmpty ? null : label,
+                      'created_by': supabase.auth.currentUser?.id,
+                    });
+                  }
+
+                  _success(
+                    '$howMany carton(s) added! Numbers: ${maxExisting + 1} to ${maxExisting + howMany}',
+                  );
                   if (mounted) Navigator.pop(context);
                   _viewMedicineBoxes(manufacturerId, manufacturerName);
                 } catch (e) {
@@ -3497,9 +3556,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // SUBSTITUTE SEARCH
-  // =========================
+  // ── SUBSTITUTE SEARCH ─────────────────────────────────────
+
   Future<void> _searchSubstitutes() async {
     final tradeName = _substituteSearchCtrl.text.trim();
     if (tradeName.isEmpty) {
@@ -3561,13 +3619,10 @@ class _SellMedicineAndInventoryPageState
           .neq('id', sourceMed['id'])
           .order('medicine_name');
 
-      final List<Map<String, dynamic>> substitutes =
-          List<Map<String, dynamic>>.from(subRes);
-
       setState(() {
         _searchedMedicine = sourceMed;
         _resolvedGeneric = genericName.trim();
-        _substituteResults = substitutes;
+        _substituteResults = List<Map<String, dynamic>>.from(subRes);
         _searchingSubstitute = false;
         _substitutedSearched = true;
       });
@@ -3580,9 +3635,8 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  // =========================
-  // HELPER WIDGETS
-  // =========================
+  // ── HELPER WIDGETS ────────────────────────────────────────
+
   Widget _infoRow(String label, String value) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
@@ -3718,9 +3772,8 @@ class _SellMedicineAndInventoryPageState
     context,
   ).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.green));
 
-  // =========================
-  // BUILD
-  // =========================
+  // ── BUILD ─────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -3839,11 +3892,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // TAB 1: SELL
-  // The "Carton Info" badge now shows REAL values
-  // fetched from Supabase using _fetchRealCartonInfo()
-  // =========================
+  // ── TAB 1: SELL ───────────────────────────────────────────
+
   Widget _buildSellTab() {
     return Column(
       children: [
@@ -3930,10 +3980,8 @@ class _SellMedicineAndInventoryPageState
                     final int spb = (m['strips_per_box'] as int?) ?? 10;
                     final int stripsRem =
                         (m['strips_remaining'] as int?) ?? (qty * spb);
+                    final String batch = m['batch_number']?.toString() ?? 'N/A';
                     final bool outOfStock = !isExpired && qty <= 0;
-
-                    // Use FutureBuilder to fetch REAL
-                    // carton info for each medicine
                     final String medicineName =
                         m['medicine_name']?.toString() ?? '';
 
@@ -3989,6 +4037,13 @@ class _SellMedicineAndInventoryPageState
                                               fontSize: 12,
                                             ),
                                           ),
+                                        Text(
+                                          '🔢 Batch: $batch',
+                                          style: const TextStyle(
+                                            color: Colors.white60,
+                                            fontSize: 11,
+                                          ),
+                                        ),
                                       ],
                                     ),
                                   ),
@@ -4011,21 +4066,16 @@ class _SellMedicineAndInventoryPageState
                                 ],
                               ),
                               const SizedBox(height: 8),
-                              // FutureBuilder fetches REAL
-                              // carton count and total boxes
-                              // from Supabase on every build
+                              // FIX: show carton count in sell card
                               FutureBuilder<Map<String, dynamic>>(
                                 future: _fetchRealCartonInfo(medicineName),
                                 builder: (ctx, snap) {
-                                  // While loading, show
-                                  // boxes and strips only
                                   final int cartonCount =
                                       snap.data?['cartonCount'] as int? ?? 1;
                                   final int totalBoxes =
                                       snap.data?['totalBoxes'] as int? ?? qty;
                                   final int avgBoxes =
                                       snap.data?['avgBoxes'] as int? ?? qty;
-
                                   return Wrap(
                                     spacing: 6,
                                     runSpacing: 4,
@@ -4042,10 +4092,9 @@ class _SellMedicineAndInventoryPageState
                                             ? Colors.greenAccent
                                             : Colors.grey,
                                       ),
-                                      // REAL carton info:
-                                      // cartonCount × avgBoxes = totalBoxes
+                                      // FIX: clear carton badge
                                       _badge(
-                                        '🏭 ${cartonCount}×${avgBoxes}=${totalBoxes}',
+                                        '🏭 $cartonCount carton(s)  •  $avgBoxes avg boxes  •  $totalBoxes total',
                                         Colors.orange,
                                       ),
                                       _badge(
@@ -4140,9 +4189,8 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // =========================
-  // TAB 2: INVENTORY
-  // =========================
+  // ── TAB 2: INVENTORY ──────────────────────────────────────
+
   Widget _buildInventoryTab() {
     return loadingManufacturers
         ? const Center(
@@ -4231,9 +4279,8 @@ class _SellMedicineAndInventoryPageState
           );
   }
 
-  // =========================
-  // TAB 3: SUBSTITUTE
-  // =========================
+  // ── TAB 3: SUBSTITUTE ─────────────────────────────────────
+
   Widget _buildSubstituteTab() {
     return Column(
       children: [
@@ -4546,6 +4593,7 @@ class _SellMedicineAndInventoryPageState
     final String mfrName =
         m['cartons']?['manufacturers']?['name']?.toString() ?? 'Unknown';
     final String genericName = m['generic_name']?.toString() ?? '';
+    final String batchNum = m['batch_number']?.toString() ?? 'N/A';
     final String shelfNum = m['shelf_number']?.toString() ?? '';
     final String shelfSide = m['shelf_side']?.toString() ?? '';
 
@@ -4633,6 +4681,14 @@ class _SellMedicineAndInventoryPageState
                             ),
                           ),
                         ),
+                      // FIX: batch shown in substitute card
+                      Text(
+                        '🔢 Batch: $batchNum',
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 11,
+                        ),
+                      ),
                     ],
                   ),
                 ),
