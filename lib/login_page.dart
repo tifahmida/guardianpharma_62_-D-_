@@ -30,16 +30,30 @@ class _MyLoginState extends State<MyLogin> {
 
   final RegExp _licenseRegex = RegExp(r'^\d{16}$');
 
+  @override
+  void dispose() {
+    emailController.dispose();
+    passwordController.dispose();
+    licenseController.dispose();
+    super.dispose();
+  }
+
   String? _getEmailError(String email) {
     if (email.isEmpty) return "Email is required";
     if (!_emailRegex.hasMatch(email)) return "Enter a valid email address";
     return null;
   }
 
+  // ── LICENSE VALIDATION ────────────────────────────────────
+  // Shows a clear message when license field is empty or wrong format.
+
   String? _getLicenseError(String license) {
-    if (license.isEmpty) return "License number is required";
-    if (!_licenseRegex.hasMatch(license))
+    if (license.isEmpty) {
+      return "Please enter your License Number to continue";
+    }
+    if (!_licenseRegex.hasMatch(license)) {
       return "License number must be exactly 16 digits";
+    }
     return null;
   }
 
@@ -48,23 +62,27 @@ class _MyLoginState extends State<MyLogin> {
     final password = passwordController.text.trim();
     final license = licenseController.text.trim();
 
+    // Step 1: Validate email
     final emailError = _getEmailError(email);
     if (emailError != null) {
       _error(emailError);
       return;
     }
 
+    // Step 2: Validate password
     if (password.isEmpty) {
       _error("Password is required");
       return;
     }
 
-    // ✅ FIXED: changed from 6 to 8
     if (password.length < 8) {
       _error("Password must be at least 8 characters");
       return;
     }
 
+    // Step 3: Validate license BEFORE attempting login
+    // This runs first so the user sees the error immediately
+    // without any network call being made yet.
     if (selectedRole == "regulatory") {
       final licenseError = _getLicenseError(license);
       if (licenseError != null) {
@@ -85,6 +103,7 @@ class _MyLoginState extends State<MyLogin> {
 
       if (res.user == null) throw "Login failed";
 
+      // Step 4: For regulatory role, also verify against DB
       if (selectedRole == "regulatory") {
         final profile = await Supabase.instance.client
             .from('profiles')
@@ -108,7 +127,7 @@ class _MyLoginState extends State<MyLogin> {
 
         if (profile['license_number'] != license) {
           await Supabase.instance.client.auth.signOut();
-          _error("License number does not match");
+          _error("License number does not match our records");
           setState(() => loading = false);
           return;
         }
@@ -143,6 +162,7 @@ class _MyLoginState extends State<MyLogin> {
 
     try {
       await Supabase.instance.client.auth.resetPasswordForEmail(email);
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text("Password reset email sent"),
@@ -165,14 +185,16 @@ class _MyLoginState extends State<MyLogin> {
     return Scaffold(
       body: Stack(
         children: [
+          // Background image
           Positioned.fill(
             child: Image.asset(
               'assets/images/guardianpharmapills.jpg',
               fit: BoxFit.cover,
             ),
           ),
+          // Dark overlay
           Positioned.fill(
-            child: Container(color: Colors.black.withOpacity(0.25)),
+            child: Container(color: const Color.fromRGBO(0, 0, 0, 0.25)),
           ),
           Center(
             child: SingleChildScrollView(
@@ -187,20 +209,23 @@ class _MyLoginState extends State<MyLogin> {
                       vertical: 32,
                     ),
                     decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.35),
+                      color: const Color.fromRGBO(0, 0, 0, 0.35),
                       borderRadius: BorderRadius.circular(28),
-                      border: Border.all(color: Colors.white.withOpacity(0.15)),
+                      border: Border.all(
+                        color: const Color.fromRGBO(255, 255, 255, 0.15),
+                      ),
                     ),
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
+                        // Pharmacy icon
                         Container(
                           padding: const EdgeInsets.all(14),
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
-                            color: Colors.white.withOpacity(0.08),
+                            color: const Color.fromRGBO(255, 255, 255, 0.08),
                             border: Border.all(
-                              color: Colors.white.withOpacity(0.12),
+                              color: const Color.fromRGBO(255, 255, 255, 0.12),
                             ),
                           ),
                           child: const Icon(
@@ -224,8 +249,7 @@ class _MyLoginState extends State<MyLogin> {
                         _input(emailController, "Email", Icons.email_outlined),
                         const SizedBox(height: 12),
 
-                        // ✅ PASSWORD with show/hide
-                        // hint updated to 8 characters
+                        // PASSWORD with show/hide toggle
                         TextField(
                           controller: passwordController,
                           obscureText: !_passwordVisible,
@@ -238,7 +262,12 @@ class _MyLoginState extends State<MyLogin> {
                             hintText: "Password (min 8 characters)",
                             hintStyle: const TextStyle(color: Colors.white38),
                             filled: true,
-                            fillColor: Colors.white.withOpacity(0.08),
+                            fillColor: const Color.fromRGBO(
+                              255,
+                              255,
+                              255,
+                              0.08,
+                            ),
                             border: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(14),
                               borderSide: BorderSide.none,
@@ -263,7 +292,7 @@ class _MyLoginState extends State<MyLogin> {
                         Container(
                           padding: const EdgeInsets.symmetric(horizontal: 12),
                           decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.08),
+                            color: const Color.fromRGBO(255, 255, 255, 0.08),
                             borderRadius: BorderRadius.circular(14),
                           ),
                           child: DropdownButton<String>(
@@ -283,14 +312,55 @@ class _MyLoginState extends State<MyLogin> {
                               ),
                             ],
                             onChanged: (value) {
-                              setState(() => selectedRole = value!);
+                              setState(() {
+                                selectedRole = value!;
+                                // Clear license field when switching roles
+                                licenseController.clear();
+                              });
                             },
                           ),
                         ),
                         const SizedBox(height: 12),
 
-                        // LICENSE (regulatory only)
+                        // LICENSE FIELD — only shown for regulatory role
                         if (selectedRole == "regulatory") ...[
+                          // Orange info box reminding user to enter license
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 8,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color.fromRGBO(255, 152, 0, 0.10),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: const Color.fromRGBO(255, 152, 0, 0.4),
+                              ),
+                            ),
+                            child: const Row(
+                              children: [
+                                Icon(
+                                  Icons.info_outline,
+                                  color: Colors.orange,
+                                  size: 14,
+                                ),
+                                SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    'License Number is required for Regulatory Authority login',
+                                    style: TextStyle(
+                                      color: Colors.orange,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+
+                          // License number input field
                           _input(
                             licenseController,
                             "License Number (16 digits)",
@@ -362,6 +432,7 @@ class _MyLoginState extends State<MyLogin> {
                         ),
                         const SizedBox(height: 14),
 
+                        // SIGN UP LINK
                         GestureDetector(
                           onTap: () {
                             Navigator.push(
@@ -407,7 +478,7 @@ class _MyLoginState extends State<MyLogin> {
         hintText: hint,
         hintStyle: const TextStyle(color: Colors.white38),
         filled: true,
-        fillColor: Colors.white.withOpacity(0.08),
+        fillColor: const Color.fromRGBO(255, 255, 255, 0.08),
         counterStyle: const TextStyle(color: Colors.white38),
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),

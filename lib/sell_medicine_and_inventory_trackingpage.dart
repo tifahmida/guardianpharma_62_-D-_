@@ -1,5 +1,6 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter_barcode_scanner_plus/flutter_barcode_scanner_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'pharmacy_wrapper_page.dart';
 
@@ -479,7 +480,7 @@ class _SellMedicineAndInventoryPageState
 
     if (widget.openBarcode) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
-        final code = await _scanBarcode();
+        final code = await _scanBarcodeCamera();
         if (code != null && code.isNotEmpty) {
           searchController.text = code;
           _filterMedicines();
@@ -548,9 +549,6 @@ class _SellMedicineAndInventoryPageState
     });
   }
 
-  // ── FETCH REAL CARTON INFO ────────────────────────────────
-  // Returns how many distinct cartons hold this medicine,
-  // total boxes, and average boxes per carton.
   Future<Map<String, dynamic>> _fetchRealCartonInfo(String medicineName) async {
     try {
       final rows = await supabase
@@ -624,57 +622,66 @@ class _SellMedicineAndInventoryPageState
     return '✅ Expires: $s';
   }
 
-  // ── BARCODE ───────────────────────────────────────────────
+  // ── BARCODE SCANNING ──────────────────────────────────────
+  // Scans using real camera. Returns the raw scanned string.
+  // Returns null if cancelled or failed.
 
-  Future<String?> _scanBarcode() async {
-    final ctrl = TextEditingController();
-    return showDialog<String>(
-      context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A2E),
-        title: const Row(
-          children: [
-            Icon(Icons.qr_code_scanner, color: Colors.blueAccent),
-            SizedBox(width: 10),
-            Text('Scan Barcode', style: TextStyle(color: Colors.white)),
-          ],
-        ),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          style: const TextStyle(color: Colors.white),
-          decoration: InputDecoration(
-            hintText: 'Enter batch number / barcode',
-            hintStyle: const TextStyle(color: Colors.white38),
-            filled: true,
-            fillColor: const Color.fromRGBO(255, 255, 255, 0.08),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(14),
-              borderSide: BorderSide.none,
-            ),
-          ),
-          onSubmitted: (v) => Navigator.pop(context, v.trim()),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, null),
-            child: const Text(
-              'Cancel',
-              style: TextStyle(color: Colors.white54),
-            ),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
-            onPressed: () => Navigator.pop(context, ctrl.text.trim()),
-            child: const Text('Confirm', style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
+  Future<String?> _scanBarcodeCamera() async {
+    try {
+      final String scanned = await FlutterBarcodeScanner.scanBarcode(
+        '#2196F3',
+        'Cancel',
+        true,
+        ScanMode.BARCODE,
+      );
+      // FlutterBarcodeScanner returns '-1' when user cancels
+      if (scanned == '-1' || scanned.isEmpty) return null;
+      return scanned;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ── LOOKUP MEDICINE IN SUPABASE BY BARCODE VALUE ──────────
+  // Tries to find a matching medicine using the raw barcode string.
+  // Searches medicine_name, generic_name, and batch_number fields.
+  // Returns the first match or null.
+
+  Future<Map<String, dynamic>?> _lookupMedicineByBarcode(
+    String barcodeValue,
+  ) async {
+    try {
+      // Try exact batch_number match first
+      final byBatch = await supabase
+          .from('medicine_boxes')
+          .select('*, cartons(*, manufacturers(name, country))')
+          .eq('pharmacy_id', PharmacySession.pharmacyId ?? '')
+          .eq('batch_number', barcodeValue)
+          .limit(1);
+
+      final List<Map<String, dynamic>> batchResults =
+          List<Map<String, dynamic>>.from(byBatch);
+      if (batchResults.isNotEmpty) return batchResults.first;
+
+      // Try medicine_name partial match
+      final byName = await supabase
+          .from('medicine_boxes')
+          .select('*, cartons(*, manufacturers(name, country))')
+          .eq('pharmacy_id', PharmacySession.pharmacyId ?? '')
+          .ilike('medicine_name', '%$barcodeValue%')
+          .limit(1);
+
+      final List<Map<String, dynamic>> nameResults =
+          List<Map<String, dynamic>>.from(byName);
+      if (nameResults.isNotEmpty) return nameResults.first;
+
+      return null;
+    } catch (e) {
+      return null;
+    }
   }
 
   // ── SELL DIALOG ───────────────────────────────────────────
-  // FIX: Added carton sale type with proper qty input and stock check.
 
   void _showSellDialog(Map<String, dynamic> medicine) {
     if (_isExpired(medicine['expiry_date']?.toString())) {
@@ -693,15 +700,10 @@ class _SellMedicineAndInventoryPageState
       return;
     }
 
-    // FIX: We treat this medicine_boxes row as belonging to 1 carton.
-    // "Selling N cartons" means selling N × all boxes in this row.
-    // Since 1 medicine_boxes row = 1 carton entry, availableCartons = 1.
-    // If you want multi-carton support in future, extend _fetchRealCartonInfo.
     const int availableCartons = 1;
 
     String saleType = 'strip';
     final qtyCtrl = TextEditingController(text: '1');
-    // FIX: separate controller for carton quantity
     final cartonQtyCtrl = TextEditingController(text: '1');
     final customerCtrl = TextEditingController();
     final phoneCtrl = TextEditingController();
@@ -725,7 +727,6 @@ class _SellMedicineAndInventoryPageState
       context: context,
       builder: (_) => StatefulBuilder(
         builder: (ctx, setDs) {
-          // FIX: carton price = all boxes × price per box
           final double pricePerCarton = pricePerBox * availableBoxes;
 
           double unitPrice;
@@ -734,7 +735,6 @@ class _SellMedicineAndInventoryPageState
           } else if (saleType == 'box') {
             unitPrice = pricePerBox;
           } else {
-            // carton
             unitPrice = pricePerCarton;
           }
 
@@ -744,7 +744,6 @@ class _SellMedicineAndInventoryPageState
 
           final double total = unitPrice * enteredQty;
 
-          // FIX: stock validation per sale type
           bool exceedsStock = false;
           String stockHintText = '';
           if (saleType == 'strip') {
@@ -755,7 +754,6 @@ class _SellMedicineAndInventoryPageState
             exceedsStock = enteredQty > availableBoxes;
             stockHintText = 'Available: $availableBoxes boxes';
           } else {
-            // carton
             exceedsStock = enteredQty > availableCartons;
             stockHintText =
                 'Available: $availableCartons carton(s) ($availableBoxes boxes total)';
@@ -790,7 +788,6 @@ class _SellMedicineAndInventoryPageState
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Info card
                   Container(
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
@@ -806,7 +803,6 @@ class _SellMedicineAndInventoryPageState
                           '📦 Stock',
                           '$availableBoxes boxes  •  $totalStripsAvailable strips',
                         ),
-                        // FIX: show carton count clearly
                         _infoRow(
                           '🏭 Cartons Available',
                           '$availableCartons carton(s)',
@@ -820,7 +816,6 @@ class _SellMedicineAndInventoryPageState
                           '💊 Price/Strip',
                           'BDT ${pricePerStrip.toStringAsFixed(2)}',
                         ),
-                        // FIX: show carton price
                         _infoRow(
                           '🏭 Price/Carton',
                           'BDT ${pricePerCarton.toStringAsFixed(2)}',
@@ -834,7 +829,6 @@ class _SellMedicineAndInventoryPageState
                     style: TextStyle(color: Colors.white70, fontSize: 13),
                   ),
                   const SizedBox(height: 8),
-                  // Sale type chips
                   Row(
                     children: [
                       _saleTypeChip(
@@ -857,7 +851,6 @@ class _SellMedicineAndInventoryPageState
                         }),
                       ),
                       const SizedBox(width: 8),
-                      // FIX: carton chip now available
                       _saleTypeChip(
                         'carton',
                         '🏭 Carton',
@@ -870,8 +863,6 @@ class _SellMedicineAndInventoryPageState
                     ],
                   ),
                   const SizedBox(height: 14),
-
-                  // FIX: strip / box qty input
                   if (saleType == 'strip' || saleType == 'box') ...[
                     TextField(
                       controller: qtyCtrl,
@@ -930,8 +921,6 @@ class _SellMedicineAndInventoryPageState
                     ],
                     const SizedBox(height: 10),
                   ],
-
-                  // FIX: carton qty input with stock check
                   if (saleType == 'carton') ...[
                     TextField(
                       controller: cartonQtyCtrl,
@@ -981,7 +970,6 @@ class _SellMedicineAndInventoryPageState
                       ),
                     ),
                     const SizedBox(height: 6),
-                    // FIX: carton info note
                     Container(
                       padding: const EdgeInsets.all(10),
                       decoration: BoxDecoration(
@@ -1010,7 +998,6 @@ class _SellMedicineAndInventoryPageState
                           Expanded(
                             child: Text(
                               exceedsStock
-                                  // FIX: clear error message when cartons exceed stock
                                   ? '❌ Not enough cartons in stock.\n   Available: $availableCartons carton(s)'
                                   : '1 carton = $availableBoxes boxes ($totalStripsAvailable strips total).\nSelling clears ALL stock for this entry.',
                               style: TextStyle(
@@ -1027,8 +1014,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                     const SizedBox(height: 10),
                   ],
-
-                  // Customer name
                   TextField(
                     controller: customerCtrl,
                     style: const TextStyle(color: Colors.white),
@@ -1048,7 +1033,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 10),
-                  // Customer phone
                   TextField(
                     controller: phoneCtrl,
                     keyboardType: TextInputType.phone,
@@ -1069,7 +1053,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 14),
-                  // Safe limit warning
                   Container(
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
@@ -1100,7 +1083,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 14),
-                  // Total display
                   Container(
                     padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
@@ -1161,7 +1143,6 @@ class _SellMedicineAndInventoryPageState
                     fontWeight: FontWeight.bold,
                   ),
                 ),
-                // FIX: disable sell button when stock is exceeded
                 onPressed: exceedsStock
                     ? null
                     : () async {
@@ -1213,7 +1194,6 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // ── STOCK ERROR BOX helper ────────────────────────────────
   Widget _stockErrorBox(String message) {
     return Container(
       padding: const EdgeInsets.all(10),
@@ -1719,8 +1699,6 @@ class _SellMedicineAndInventoryPageState
   }
 
   // ── COMPLETE SALE ─────────────────────────────────────────
-  // FIX: carton sale type now deducts ALL strips (same as before)
-  // and clears the medicine_boxes row when stock hits zero.
 
   Future<void> _completeSale({
     required Map<String, dynamic> medicine,
@@ -1765,7 +1743,6 @@ class _SellMedicineAndInventoryPageState
 
       int stripsToDeduct;
       if (saleType == 'carton') {
-        // FIX: selling 1 carton clears all strips in this row
         stripsToDeduct = currentStrips;
       } else if (saleType == 'box') {
         stripsToDeduct = qty * spb;
@@ -2086,6 +2063,11 @@ class _SellMedicineAndInventoryPageState
   }
 
   // ── ADD / EDIT MEDICINE BOX ───────────────────────────────
+  // FEATURE 1: Scan Barcode button at top.
+  // When tapped → opens camera → scans barcode → looks up medicine in DB
+  // → auto-fills ALL fields (name, generic, batch, expiry, price, strips, unit)
+  // No dialog or manual input is shown for the barcode value itself.
+  // All fields remain editable after auto-fill.
 
   void _showMedicineBoxDialog(
     String cartonId,
@@ -2120,6 +2102,7 @@ class _SellMedicineAndInventoryPageState
     final shelfNumCtrl = TextEditingController(
       text: existing?['shelf_number']?.toString() ?? '',
     );
+
     String? selectedShelfSide = existing?['shelf_side']?.toString();
     String selectedUnit = existing?['unit'] ?? 'Tablets';
     bool isCustomUnit = !_units.contains(selectedUnit);
@@ -2127,351 +2110,559 @@ class _SellMedicineAndInventoryPageState
       customUnitCtrl.text = selectedUnit;
       selectedUnit = 'Custom';
     }
+
     final bool isEditing = existing != null;
     final String existingId = existing?['id']?.toString() ?? '';
+
+    // Tracks whether a barcode scan is in progress
+    bool isScanning = false;
+    // Message shown after scan attempt
+    String scanStatusMessage = '';
+    bool scanSuccess = false;
 
     showDialog(
       context: context,
       builder: (_) => StatefulBuilder(
-        builder: (ctx, setDs) => AlertDialog(
-          backgroundColor: const Color(0xFF1A1A2E),
-          title: Row(
-            children: [
-              const Icon(Icons.medication, color: Colors.blueAccent),
-              const SizedBox(width: 8),
-              Text(
-                isEditing ? 'Edit Medicine Box' : 'Add Medicine Box',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+        builder: (ctx, setDs) {
+          // ── BARCODE SCAN HANDLER ─────────────────────────
+          // Step 1: Open camera and scan
+          // Step 2: Look up scanned value in DB (no manual input dialog)
+          // Step 3: If found → auto-fill fields
+          // Step 4: If not found → show "not found" message, keep fields empty
+
+          Future<void> handleBarcodeScan() async {
+            setDs(() {
+              isScanning = true;
+              scanStatusMessage = '';
+            });
+
+            // Open camera scanner directly — no manual input dialog here
+            final String? scanned = await _scanBarcodeCamera();
+
+            if (scanned == null || scanned.isEmpty) {
+              // User cancelled scan
+              setDs(() {
+                isScanning = false;
+                scanStatusMessage = '';
+              });
+              return;
+            }
+
+            // Look up the scanned barcode in the inventory database
+            final Map<String, dynamic>? found = await _lookupMedicineByBarcode(
+              scanned,
+            );
+
+            if (found != null) {
+              // Found a matching medicine — auto-fill all fields
+              setDs(() {
+                isScanning = false;
+                scanSuccess = true;
+                scanStatusMessage =
+                    '✅ Medicine found! Fields auto-filled. You can still edit them.';
+
+                // Fill each field only if data exists
+                if ((found['medicine_name'] ?? '').toString().isNotEmpty) {
+                  nameCtrl.text = found['medicine_name'].toString();
+                }
+                if ((found['generic_name'] ?? '').toString().isNotEmpty) {
+                  genericCtrl.text = found['generic_name'].toString();
+                }
+                if ((found['batch_number'] ?? '').toString().isNotEmpty) {
+                  batchCtrl.text = found['batch_number'].toString();
+                }
+                if ((found['expiry_date'] ?? '').toString().isNotEmpty) {
+                  expiryCtrl.text = found['expiry_date'].toString();
+                }
+                if ((found['price'] ?? '').toString().isNotEmpty) {
+                  priceCtrl.text = found['price'].toString();
+                }
+                if ((found['strips_per_box'] ?? '').toString().isNotEmpty) {
+                  stripsCtrl.text = found['strips_per_box'].toString();
+                }
+                if ((found['price_per_strip'] ?? '').toString().isNotEmpty) {
+                  stripPriceCtrl.text = found['price_per_strip'].toString();
+                }
+                // Fill unit if valid
+                final String foundUnit = found['unit']?.toString() ?? '';
+                if (foundUnit.isNotEmpty && _units.contains(foundUnit)) {
+                  selectedUnit = foundUnit;
+                  isCustomUnit = false;
+                }
+              });
+            } else {
+              // Barcode scanned but no matching medicine found in DB
+              setDs(() {
+                isScanning = false;
+                scanSuccess = false;
+                scanStatusMessage =
+                    '⚠️ No medicine found for this barcode.\nPlease enter details manually below.';
+              });
+            }
+          }
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1A1A2E),
+            title: Row(
               children: [
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: const Color.fromRGBO(105, 240, 174, 0.1),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.business,
-                        color: Colors.greenAccent,
-                        size: 16,
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        manufacturerName,
-                        style: const TextStyle(
-                          color: Colors.greenAccent,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-                _dialogField(nameCtrl, 'Medicine Name *', Icons.medication),
-                const SizedBox(height: 10),
-                _dialogField(
-                  genericCtrl,
-                  'Generic Name (e.g. Paracetamol)',
-                  Icons.science_outlined,
-                ),
-                const SizedBox(height: 10),
-                _dialogField(batchCtrl, 'Batch Number *', Icons.numbers),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: expiryCtrl,
-                  readOnly: true,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    prefixIcon: const Icon(
-                      Icons.calendar_today,
-                      color: Colors.white70,
-                    ),
-                    hintText: 'Expiry Date *',
-                    hintStyle: const TextStyle(color: Colors.white38),
-                    filled: true,
-                    fillColor: const Color.fromRGBO(255, 255, 255, 0.08),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide.none,
-                    ),
-                  ),
-                  onTap: () async {
-                    final picked = await showDatePicker(
-                      context: context,
-                      initialDate: DateTime.now().add(const Duration(days: 30)),
-                      firstDate: DateTime.now(),
-                      lastDate: DateTime(2100),
-                    );
-                    if (picked != null) {
-                      expiryCtrl.text =
-                          '${picked.year}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
-                    }
-                  },
-                ),
-                const SizedBox(height: 10),
-                _dialogField(
-                  qtyCtrl,
-                  'Quantity (boxes) *',
-                  Icons.inventory,
-                  isNumber: true,
-                ),
-                const SizedBox(height: 10),
-                _dialogField(
-                  stripsCtrl,
-                  'Strips per Box',
-                  Icons.view_module,
-                  isNumber: true,
-                ),
-                const SizedBox(height: 10),
-                _dialogField(
-                  priceCtrl,
-                  'Price per Box (BDT) *',
-                  Icons.attach_money,
-                  isDecimal: true,
-                ),
-                const SizedBox(height: 10),
-                _dialogField(
-                  stripPriceCtrl,
-                  'Price per Strip (BDT)',
-                  Icons.money,
-                  isDecimal: true,
-                ),
-                const SizedBox(height: 10),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  decoration: BoxDecoration(
-                    color: const Color.fromRGBO(255, 255, 255, 0.08),
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  child: DropdownButton<String>(
-                    value: selectedUnit,
-                    dropdownColor: const Color(0xFF1A1A2E),
-                    underline: const SizedBox(),
-                    isExpanded: true,
-                    style: const TextStyle(color: Colors.white),
-                    icon: const Icon(
-                      Icons.arrow_drop_down,
-                      color: Colors.white54,
-                    ),
-                    items: _units
-                        .map(
-                          (u) => DropdownMenuItem(
-                            value: u,
-                            child: Row(
-                              children: [
-                                const Icon(
-                                  Icons.category,
-                                  color: Colors.white70,
-                                  size: 18,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  u,
-                                  style: const TextStyle(color: Colors.white),
-                                ),
-                              ],
-                            ),
-                          ),
-                        )
-                        .toList(),
-                    onChanged: (v) => setDs(() {
-                      selectedUnit = v ?? selectedUnit;
-                      isCustomUnit = selectedUnit == 'Custom';
-                    }),
-                  ),
-                ),
-                if (isCustomUnit) ...[
-                  const SizedBox(height: 10),
-                  _dialogField(customUnitCtrl, 'Custom Unit', Icons.edit),
-                ],
-                const SizedBox(height: 14),
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: const Color.fromRGBO(179, 136, 255, 0.08),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(
-                      color: const Color.fromRGBO(179, 136, 255, 0.3),
-                    ),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Row(
-                        children: [
-                          Icon(
-                            Icons.shelves,
-                            color: Colors.purpleAccent,
-                            size: 14,
-                          ),
-                          SizedBox(width: 6),
-                          Text(
-                            'Shelf Location (optional)',
-                            style: TextStyle(
-                              color: Colors.purpleAccent,
-                              fontSize: 12,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                      _dialogField(
-                        shelfNumCtrl,
-                        'Shelf Number (e.g. A1, B2)',
-                        Icons.tag,
-                      ),
-                      const SizedBox(height: 10),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12),
-                        decoration: BoxDecoration(
-                          color: const Color.fromRGBO(255, 255, 255, 0.08),
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: DropdownButton<String>(
-                          value: selectedShelfSide,
-                          dropdownColor: const Color(0xFF1A1A2E),
-                          underline: const SizedBox(),
-                          isExpanded: true,
-                          hint: const Text(
-                            'Shelf Side (optional)',
-                            style: TextStyle(color: Colors.white38),
-                          ),
-                          style: const TextStyle(color: Colors.white),
-                          icon: const Icon(
-                            Icons.arrow_drop_down,
-                            color: Colors.white54,
-                          ),
-                          items: _shelfSides
-                              .map(
-                                (s) => DropdownMenuItem(
-                                  value: s,
-                                  child: Row(
-                                    children: [
-                                      const Icon(
-                                        Icons.align_horizontal_center,
-                                        color: Colors.white70,
-                                        size: 18,
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Text(
-                                        s,
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              )
-                              .toList(),
-                          onChanged: (v) => setDs(() => selectedShelfSide = v),
-                        ),
-                      ),
-                    ],
+                const Icon(Icons.medication, color: Colors.blueAccent),
+                const SizedBox(width: 8),
+                Text(
+                  isEditing ? 'Edit Medicine Box' : 'Add Medicine Box',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
                   ),
                 ),
               ],
             ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text(
-                'Cancel',
-                style: TextStyle(color: Colors.white54),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Manufacturer badge
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color.fromRGBO(105, 240, 174, 0.1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.business,
+                          color: Colors.greenAccent,
+                          size: 16,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          manufacturerName,
+                          style: const TextStyle(
+                            color: Colors.greenAccent,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // ── SCAN BARCODE BUTTON ──────────────────
+                  // Tapping this opens the camera directly.
+                  // No manual barcode input dialog is shown.
+                  // After scan: looks up in DB and auto-fills fields.
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blueAccent,
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                          ),
+                          onPressed: isScanning ? null : handleBarcodeScan,
+                          icon: isScanning
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    color: Colors.white,
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(
+                                  Icons.qr_code_scanner,
+                                  color: Colors.white,
+                                  size: 20,
+                                ),
+                          label: Text(
+                            isScanning ? 'Scanning...' : '📷 Scan Barcode',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  // Scan result message
+                  if (scanStatusMessage.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: scanSuccess
+                            ? const Color.fromRGBO(76, 175, 80, 0.12)
+                            : const Color.fromRGBO(255, 152, 0, 0.12),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: scanSuccess
+                              ? const Color.fromRGBO(76, 175, 80, 0.4)
+                              : const Color.fromRGBO(255, 152, 0, 0.4),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            scanSuccess
+                                ? Icons.check_circle_outline
+                                : Icons.info_outline,
+                            color: scanSuccess
+                                ? Colors.greenAccent
+                                : Colors.orange,
+                            size: 16,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              scanStatusMessage,
+                              style: TextStyle(
+                                color: scanSuccess
+                                    ? Colors.greenAccent
+                                    : Colors.orange,
+                                fontSize: 12,
+                                height: 1.4,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Divider(
+                          color: Colors.white.withValues(alpha: 0.15),
+                        ),
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 10),
+                        child: Text(
+                          'or enter manually',
+                          style: TextStyle(color: Colors.white38, fontSize: 11),
+                        ),
+                      ),
+                      Expanded(
+                        child: Divider(
+                          color: Colors.white.withValues(alpha: 0.15),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+
+                  // ── MANUAL ENTRY FIELDS ──────────────────
+                  _dialogField(nameCtrl, 'Medicine Name *', Icons.medication),
+                  const SizedBox(height: 10),
+                  _dialogField(
+                    genericCtrl,
+                    'Generic Name (e.g. Paracetamol)',
+                    Icons.science_outlined,
+                  ),
+                  const SizedBox(height: 10),
+                  _dialogField(batchCtrl, 'Batch Number *', Icons.numbers),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: expiryCtrl,
+                    readOnly: true,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: InputDecoration(
+                      prefixIcon: const Icon(
+                        Icons.calendar_today,
+                        color: Colors.white70,
+                      ),
+                      hintText: 'Expiry Date *',
+                      hintStyle: const TextStyle(color: Colors.white38),
+                      filled: true,
+                      fillColor: const Color.fromRGBO(255, 255, 255, 0.08),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(14),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                    onTap: () async {
+                      final picked = await showDatePicker(
+                        context: context,
+                        initialDate: DateTime.now().add(
+                          const Duration(days: 30),
+                        ),
+                        firstDate: DateTime.now(),
+                        lastDate: DateTime(2100),
+                      );
+                      if (picked != null) {
+                        setDs(() {
+                          expiryCtrl.text =
+                              '${picked.year}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
+                        });
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  _dialogField(
+                    qtyCtrl,
+                    'Quantity (boxes) *',
+                    Icons.inventory,
+                    isNumber: true,
+                  ),
+                  const SizedBox(height: 10),
+                  _dialogField(
+                    stripsCtrl,
+                    'Strips per Box',
+                    Icons.view_module,
+                    isNumber: true,
+                  ),
+                  const SizedBox(height: 10),
+                  _dialogField(
+                    priceCtrl,
+                    'Price per Box (BDT) *',
+                    Icons.attach_money,
+                    isDecimal: true,
+                  ),
+                  const SizedBox(height: 10),
+                  _dialogField(
+                    stripPriceCtrl,
+                    'Price per Strip (BDT)',
+                    Icons.money,
+                    isDecimal: true,
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    decoration: BoxDecoration(
+                      color: const Color.fromRGBO(255, 255, 255, 0.08),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: DropdownButton<String>(
+                      value: selectedUnit,
+                      dropdownColor: const Color(0xFF1A1A2E),
+                      underline: const SizedBox(),
+                      isExpanded: true,
+                      style: const TextStyle(color: Colors.white),
+                      icon: const Icon(
+                        Icons.arrow_drop_down,
+                        color: Colors.white54,
+                      ),
+                      items: _units
+                          .map(
+                            (u) => DropdownMenuItem(
+                              value: u,
+                              child: Row(
+                                children: [
+                                  const Icon(
+                                    Icons.category,
+                                    color: Colors.white70,
+                                    size: 18,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    u,
+                                    style: const TextStyle(color: Colors.white),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: (v) => setDs(() {
+                        selectedUnit = v ?? selectedUnit;
+                        isCustomUnit = selectedUnit == 'Custom';
+                      }),
+                    ),
+                  ),
+                  if (isCustomUnit) ...[
+                    const SizedBox(height: 10),
+                    _dialogField(customUnitCtrl, 'Custom Unit', Icons.edit),
+                  ],
+                  const SizedBox(height: 14),
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color.fromRGBO(179, 136, 255, 0.08),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: const Color.fromRGBO(179, 136, 255, 0.3),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Row(
+                          children: [
+                            Icon(
+                              Icons.shelves,
+                              color: Colors.purpleAccent,
+                              size: 14,
+                            ),
+                            SizedBox(width: 6),
+                            Text(
+                              'Shelf Location (optional)',
+                              style: TextStyle(
+                                color: Colors.purpleAccent,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        _dialogField(
+                          shelfNumCtrl,
+                          'Shelf Number (e.g. A1, B2)',
+                          Icons.tag,
+                        ),
+                        const SizedBox(height: 10),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          decoration: BoxDecoration(
+                            color: const Color.fromRGBO(255, 255, 255, 0.08),
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          child: DropdownButton<String>(
+                            value: selectedShelfSide,
+                            dropdownColor: const Color(0xFF1A1A2E),
+                            underline: const SizedBox(),
+                            isExpanded: true,
+                            hint: const Text(
+                              'Shelf Side (optional)',
+                              style: TextStyle(color: Colors.white38),
+                            ),
+                            style: const TextStyle(color: Colors.white),
+                            icon: const Icon(
+                              Icons.arrow_drop_down,
+                              color: Colors.white54,
+                            ),
+                            items: _shelfSides
+                                .map(
+                                  (s) => DropdownMenuItem(
+                                    value: s,
+                                    child: Row(
+                                      children: [
+                                        const Icon(
+                                          Icons.align_horizontal_center,
+                                          color: Colors.white70,
+                                          size: 18,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          s,
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                )
+                                .toList(),
+                            onChanged: (v) =>
+                                setDs(() => selectedShelfSide = v),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ),
             ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.blueAccent,
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text(
+                  'Cancel',
+                  style: TextStyle(color: Colors.white54),
+                ),
               ),
-              onPressed: () async {
-                final name = nameCtrl.text.trim();
-                final batch = batchCtrl.text.trim();
-                final expiry = expiryCtrl.text.trim();
-                final qty = int.tryParse(qtyCtrl.text.trim()) ?? 0;
-                final price = double.tryParse(priceCtrl.text.trim()) ?? 0.0;
-                final strips = int.tryParse(stripsCtrl.text.trim()) ?? 10;
-                final stripPrice = double.tryParse(stripPriceCtrl.text.trim());
-                final unit = isCustomUnit
-                    ? customUnitCtrl.text.trim()
-                    : selectedUnit;
-                final shelfNum = shelfNumCtrl.text.trim();
-                final int initialStrips = qty * strips;
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blueAccent,
+                ),
+                onPressed: () async {
+                  final name = nameCtrl.text.trim();
+                  final batch = batchCtrl.text.trim();
+                  final expiry = expiryCtrl.text.trim();
+                  final qty = int.tryParse(qtyCtrl.text.trim()) ?? 0;
+                  final price = double.tryParse(priceCtrl.text.trim()) ?? 0.0;
+                  final strips = int.tryParse(stripsCtrl.text.trim()) ?? 10;
+                  final stripPrice = double.tryParse(
+                    stripPriceCtrl.text.trim(),
+                  );
+                  final unit = isCustomUnit
+                      ? customUnitCtrl.text.trim()
+                      : selectedUnit;
+                  final shelfNum = shelfNumCtrl.text.trim();
+                  final int initialStrips = qty * strips;
 
-                if (name.isEmpty || batch.isEmpty || expiry.isEmpty) {
-                  _error('Fill all required fields (*)');
-                  return;
-                }
-
-                try {
-                  if (isEditing) {
-                    await supabase
-                        .from('medicine_boxes')
-                        .update({
-                          'medicine_name': name,
-                          'generic_name': genericCtrl.text.trim().isEmpty
-                              ? null
-                              : genericCtrl.text.trim(),
-                          'batch_number': batch,
-                          'expiry_date': expiry,
-                          'quantity': qty,
-                          'strips_per_box': strips,
-                          'strips_remaining': initialStrips,
-                          'unit': unit,
-                          'price': price,
-                          'price_per_strip': stripPrice,
-                          'shelf_number': shelfNum.isEmpty ? null : shelfNum,
-                          'shelf_side': selectedShelfSide,
-                        })
-                        .eq('id', existingId);
-                    _success('Medicine box updated!');
-                  } else {
-                    await supabase.from('medicine_boxes').insert({
-                      'carton_id': cartonId,
-                      'medicine_name': name,
-                      'generic_name': genericCtrl.text.trim().isEmpty
-                          ? null
-                          : genericCtrl.text.trim(),
-                      'batch_number': batch,
-                      'expiry_date': expiry,
-                      'quantity': qty,
-                      'strips_per_box': strips,
-                      'strips_remaining': initialStrips,
-                      'unit': unit,
-                      'price': price,
-                      'price_per_strip': stripPrice,
-                      'shelf_number': shelfNum.isEmpty ? null : shelfNum,
-                      'shelf_side': selectedShelfSide,
-                      'created_by': supabase.auth.currentUser?.id,
-                      'pharmacy_id': PharmacySession.pharmacyId,
-                    });
-                    _success('Medicine box added!');
+                  if (name.isEmpty || batch.isEmpty || expiry.isEmpty) {
+                    _error('Fill all required fields (*)');
+                    return;
                   }
-                  if (mounted) Navigator.pop(context);
-                  _loadMedicines();
-                } catch (e) {
-                  _error('Error: $e');
-                }
-              },
-              child: Text(
-                isEditing ? 'Update' : 'Add',
-                style: const TextStyle(color: Colors.white),
+
+                  try {
+                    if (isEditing) {
+                      await supabase
+                          .from('medicine_boxes')
+                          .update({
+                            'medicine_name': name,
+                            'generic_name': genericCtrl.text.trim().isEmpty
+                                ? null
+                                : genericCtrl.text.trim(),
+                            'batch_number': batch,
+                            'expiry_date': expiry,
+                            'quantity': qty,
+                            'strips_per_box': strips,
+                            'strips_remaining': initialStrips,
+                            'unit': unit,
+                            'price': price,
+                            'price_per_strip': stripPrice,
+                            'shelf_number': shelfNum.isEmpty ? null : shelfNum,
+                            'shelf_side': selectedShelfSide,
+                          })
+                          .eq('id', existingId);
+                      _success('Medicine box updated!');
+                    } else {
+                      await supabase.from('medicine_boxes').insert({
+                        'carton_id': cartonId,
+                        'medicine_name': name,
+                        'generic_name': genericCtrl.text.trim().isEmpty
+                            ? null
+                            : genericCtrl.text.trim(),
+                        'batch_number': batch,
+                        'expiry_date': expiry,
+                        'quantity': qty,
+                        'strips_per_box': strips,
+                        'strips_remaining': initialStrips,
+                        'unit': unit,
+                        'price': price,
+                        'price_per_strip': stripPrice,
+                        'shelf_number': shelfNum.isEmpty ? null : shelfNum,
+                        'shelf_side': selectedShelfSide,
+                        'created_by': supabase.auth.currentUser?.id,
+                        'pharmacy_id': PharmacySession.pharmacyId,
+                      });
+                      _success('Medicine box added!');
+                    }
+                    if (mounted) Navigator.pop(context);
+                    _loadMedicines();
+                  } catch (e) {
+                    _error('Error: $e');
+                  }
+                },
+                child: Text(
+                  isEditing ? 'Update' : 'Add',
+                  style: const TextStyle(color: Colors.white),
+                ),
               ),
-            ),
-          ],
-        ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -3919,6 +4110,7 @@ class _SellMedicineAndInventoryPageState
                 ),
               ),
               const SizedBox(width: 10),
+              // Barcode scan button for sell tab — fills search field
               Container(
                 decoration: BoxDecoration(
                   color: Colors.blueAccent,
@@ -3927,9 +4119,9 @@ class _SellMedicineAndInventoryPageState
                 child: IconButton(
                   icon: const Icon(Icons.qr_code_scanner, color: Colors.white),
                   onPressed: () async {
-                    final code = await _scanBarcode();
-                    if (code != null && code.isNotEmpty) {
-                      searchController.text = code;
+                    final String? scanned = await _scanBarcodeCamera();
+                    if (scanned != null && scanned.isNotEmpty) {
+                      searchController.text = scanned;
                       _filterMedicines();
                     }
                   },
@@ -4066,7 +4258,6 @@ class _SellMedicineAndInventoryPageState
                                 ],
                               ),
                               const SizedBox(height: 8),
-                              // FIX: show carton count in sell card
                               FutureBuilder<Map<String, dynamic>>(
                                 future: _fetchRealCartonInfo(medicineName),
                                 builder: (ctx, snap) {
@@ -4092,7 +4283,6 @@ class _SellMedicineAndInventoryPageState
                                             ? Colors.greenAccent
                                             : Colors.grey,
                                       ),
-                                      // FIX: clear carton badge
                                       _badge(
                                         '🏭 $cartonCount carton(s)  •  $avgBoxes avg boxes  •  $totalBoxes total',
                                         Colors.orange,
@@ -4280,6 +4470,10 @@ class _SellMedicineAndInventoryPageState
   }
 
   // ── TAB 3: SUBSTITUTE ─────────────────────────────────────
+  // FEATURE 2: Scan Barcode button beside search field.
+  // When tapped → opens camera → scans barcode → looks up medicine in DB
+  // → gets medicine name → fills search field → auto-searches substitutes.
+  // No manual barcode input dialog is shown.
 
   Widget _buildSubstituteTab() {
     return Column(
@@ -4317,7 +4511,7 @@ class _SellMedicineAndInventoryPageState
                     ),
                     SizedBox(height: 6),
                     Text(
-                      '1. Type the trade name (e.g. "Napa")\n2. App finds its generic (Paracetamol)\n3. All medicines with same generic shown',
+                      '1. Type or scan the trade name (e.g. "Napa")\n2. App finds its generic (Paracetamol)\n3. All medicines with same generic shown',
                       style: TextStyle(
                         color: Colors.white60,
                         fontSize: 12,
@@ -4330,6 +4524,7 @@ class _SellMedicineAndInventoryPageState
               const SizedBox(height: 10),
               Row(
                 children: [
+                  // Manual text entry
                   Expanded(
                     child: TextField(
                       controller: _substituteSearchCtrl,
@@ -4369,7 +4564,83 @@ class _SellMedicineAndInventoryPageState
                       ),
                     ),
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: 8),
+
+                  // ── BARCODE SCAN BUTTON for Substitute tab ──
+                  // Opens camera directly — no manual input dialog.
+                  // Scan → lookup medicine → fill trade name → search.
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Colors.teal,
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: IconButton(
+                      icon: const Icon(
+                        Icons.qr_code_scanner,
+                        color: Colors.white,
+                      ),
+                      tooltip: 'Scan barcode to find substitute',
+                      onPressed: _searchingSubstitute
+                          ? null
+                          : () async {
+                              // Step 1: Open camera and scan — no dialog
+                              final String? scanned =
+                                  await _scanBarcodeCamera();
+
+                              if (scanned == null || scanned.isEmpty) {
+                                return; // User cancelled
+                              }
+
+                              setState(() => _searchingSubstitute = true);
+
+                              // Step 2: Look up medicine using scanned value
+                              final Map<String, dynamic>? found =
+                                  await _lookupMedicineByBarcode(scanned);
+
+                              if (!mounted) return;
+
+                              if (found == null) {
+                                // Nothing found for this barcode
+                                setState(() => _searchingSubstitute = false);
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      'No medicine found for this barcode.',
+                                      style: TextStyle(color: Colors.white),
+                                    ),
+                                    backgroundColor: Colors.orange,
+                                  ),
+                                );
+                                return;
+                              }
+
+                              // Step 3: Get the medicine name and fill field
+                              final String medicineName =
+                                  found['medicine_name']?.toString() ?? '';
+
+                              if (medicineName.isEmpty) {
+                                setState(() => _searchingSubstitute = false);
+                                _error(
+                                  'No medicine name found for this barcode.',
+                                );
+                                return;
+                              }
+
+                              // Step 4: Fill search field with medicine name
+                              setState(() {
+                                _substituteSearchCtrl.text = medicineName;
+                                _searchingSubstitute = false;
+                              });
+
+                              // Step 5: Auto-run substitute search
+                              _searchSubstitutes();
+                            },
+                    ),
+                  ),
+
+                  const SizedBox(width: 8),
+
+                  // Manual search button
                   Container(
                     decoration: BoxDecoration(
                       color: Colors.purple,
@@ -4417,7 +4688,7 @@ class _SellMedicineAndInventoryPageState
                       Padding(
                         padding: EdgeInsets.symmetric(horizontal: 40),
                         child: Text(
-                          'Type a medicine trade name above to find substitutes with the same generic ingredient',
+                          'Type or scan a medicine barcode above to find substitutes with the same generic ingredient',
                           textAlign: TextAlign.center,
                           style: TextStyle(color: Colors.white38, fontSize: 12),
                         ),
@@ -4681,7 +4952,6 @@ class _SellMedicineAndInventoryPageState
                             ),
                           ),
                         ),
-                      // FIX: batch shown in substitute card
                       Text(
                         '🔢 Batch: $batchNum',
                         style: const TextStyle(
